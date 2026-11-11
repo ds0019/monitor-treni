@@ -1,0 +1,59 @@
+# Va messo nel repository come:  .github/workflows/monitor.yml
+name: Monitor posti carnet
+
+on:
+  schedule:
+    - cron: "2-59/5 * * * *"   # ogni 5 minuti (GitHub puo' ritardare di qualche minuto)
+  workflow_dispatch:            # pulsante "Run workflow" per lanciarlo a mano
+
+concurrency:
+  group: monitor-carnet
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  controlla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests tzdata
+
+      - name: Recupera lo stato del giro precedente
+        uses: actions/cache/restore@v6
+        with:
+          path: stato.json
+          key: stato-${{ github.run_id }}
+          restore-keys: stato-
+
+      - name: Prepara la richiesta carnet (solo se hai creato il secret RICHIESTA_CARNET)
+        env:
+          RICHIESTA_CARNET: ${{ secrets.RICHIESTA_CARNET }}
+        run: |
+          if [ -n "$RICHIESTA_CARNET" ]; then
+            printf '%s' "$RICHIESTA_CARNET" > richiesta_carnet.txt
+            echo "MODO=--carnet" >> "$GITHUB_ENV"
+          fi
+
+      - name: Controlla i treni
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ESCLUDI: ${{ vars.ESCLUDI }}
+          GIORNI_AVANTI: ${{ vars.GIORNI_AVANTI }}
+        run: python monitor_carnet.py --una-volta $MODO
+
+      - name: Salva lo stato per il giro successivo
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: stato.json
+          key: stato-${{ github.run_id }}
