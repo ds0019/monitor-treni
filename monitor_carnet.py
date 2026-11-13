@@ -52,7 +52,7 @@ VIAGGI = [
     {"nome": "Andata",  "da": "Torino Porta Susa", "a": "Milano Porta Garibaldi", "ora": "07:50"},
     {"nome": "Ritorno", "da": "Milano Centrale",   "a": "Torino Porta Susa",      "ora": "18:10"},
 ]
-GIORNI_SETTIMANA = (0, 3)   # 0=lun 1=mar 2=mer 3=gio 4=ven  -> lunedi' e giovedi'
+GIORNI_SETTIMANA = (0,1,2,3)   # 0=lun 1=mar 2=mer 3=gio 4=ven  -> lunedi' e giovedi'
 GIORNI_AVANTI = int(os.environ.get("GIORNI_AVANTI") or 14)  # finestra da controllare
 INTERVALLO_MINUTI = 5
 
