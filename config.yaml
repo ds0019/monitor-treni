@@ -1,0 +1,46 @@
+# Configurazione del monitor posti Frecciarossa.
+# La repo e' pubblica: qui NON vanno dati segreti (il nome ntfy resta nei secret di GitHub).
+
+# Treni da controllare. Metti sempre gli orari tra virgolette: "07:50".
+viaggi:
+  - nome: Andata
+    da: Torino Porta Susa
+    a: Milano Porta Garibaldi
+    ora: "07:50"
+  - nome: Ritorno
+    da: Milano Centrale
+    a: Torino Porta Susa
+    ora: "18:10"
+
+# Giorni della settimana da controllare: lun, mar, mer, gio, ven, sab, dom
+giorni: [lun, mar, mer, gio]
+
+# Quanti giorni in avanti controllare, a partire da oggi.
+# Se su GitHub esiste la variabile GIORNI_AVANTI, vale quella.
+giorni_avanti: 14
+
+# Classi che vanno bene per il tuo carnet (2a classe/Standard).
+# Un servizio conta se il nome contiene una parola di "ammesse" e nessuna di "escluse".
+classi:
+  ammesse: [standard, "2ª", 2a classe, seconda]
+  escluse: [salottino, executive, premium, business]
+
+# Viaggi gia' prenotati da non controllare, es. ["16/11 andata", "19/11"].
+# Si sommano a quelli della variabile GitHub ESCLUDI (piu' comoda da aggiornare dal telefono).
+escludi: []
+
+# Giorni speciali: per questi viaggi avvisa a OGNI controllo finche' c'e' posto,
+# non una volta sola. Stesso formato, es. ["16/11 andata", "19/11"].
+# Si sommano a quelli della variabile GitHub GIORNI_SPECIALI. Se un viaggio e' anche in
+# ESCLUDI/escludi, vince l'esclusione.
+giorni_speciali: []
+
+notifiche:
+  # Cosa si apre toccando la notifica: il Comando Rapido "Trenitalia" (apre l'app)
+  # oppure il sito: https://www.trenitalia.com/
+  link: "shortcuts://run-shortcut?name=Trenitalia"
+  # Priorita' ntfy degli avvisi di posto libero: 5 = massima, 3 = normale
+  priorita: 5
+
+# Solo quando lo lanci in continuo su un computer (su GitHub decide cron-job.org)
+intervallo_minuti: 5
