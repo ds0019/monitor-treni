@@ -1,133 +1,170 @@
 #!/usr/bin/env python3
 """
-monitor_carnet.py
-Controlla se si libera un posto in 2a classe/Standard sui tuoi Frecciarossa
-del lunedi' e del giovedi' e ti manda una notifica sul telefono (ntfy e/o Telegram).
+monitor_carnet.py - avvisa sul telefono quando si libera un posto sui tuoi Frecciarossa.
 
-  Andata : 07:50 Torino Porta Susa -> Milano Porta Garibaldi
-  Ritorno: 18:10 Milano Centrale   -> Torino Porta Susa
+File del progetto:
+  config.yaml        treni, giorni, classi, link della notifica  <- di solito si modifica solo questo
+  trenitalia.py      ricerca dei treni sul sito Trenitalia
+  notifiche.py       invio delle notifiche (ntfy / Telegram)
+  monitor_carnet.py  questo file: configurazione, stato, ciclo dei controlli, avvio
 
-Pensato per GitHub Actions (vedi LEGGIMI.md), ma gira anche su qualsiasi computer:
-  pip install requests tzdata
-  export NTFY_TOPIC="un-nome-segreto-a-tua-scelta"
+Uso:
+  pip install requests tzdata pyyaml
   python3 monitor_carnet.py --test-notifica   # prova la notifica
-  python3 monitor_carnet.py                   # modalita' pubblica, controllo continuo
-  python3 monitor_carnet.py --una-volta       # un solo controllo (GitHub Actions / cron)
-  python3 monitor_carnet.py --carnet          # modalita' carnet
+  python3 monitor_carnet.py                   # controllo continuo (computer)
+  python3 monitor_carnet.py --una-volta       # un solo controllo (GitHub Actions, cron)
+  python3 monitor_carnet.py --carnet          # modalita' carnet (richiesta_carnet.txt)
 
-Variabili d'ambiente facoltative:
-  ESCLUDI        viaggi gia' prenotati da non controllare, separati da virgola,
-                 es. "16/11 andata, 19/11" (senza andata/ritorno = tutto il giorno)
-  GIORNI_AVANTI  quanti giorni in avanti controllare (predefinito 14)
-
-Lo script NON prenota: ti avvisa, e prenoti tu dal sito o dall'app.
-Usa le API non ufficiali del sito lefrecce.it: possono cambiare senza preavviso.
+Variabili d'ambiente:
+  NTFY_TOPIC, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID   segreti per le notifiche (vedi notifiche.py)
+  ESCLUDI          viaggi gia' prenotati, es. "16/11 andata, 19/11" (si somma a config.yaml)
+  GIORNI_SPECIALI  viaggi per cui avvisare a OGNI controllo finche' c'e' posto, stesso formato
+                   (si somma a giorni_speciali di config.yaml; ESCLUDI vince su GIORNI_SPECIALI)
+  GIORNI_AVANTI    sostituisce giorni_avanti di config.yaml
+  LINK_NOTIFICA    sostituisce notifiche.link di config.yaml
 """
 from __future__ import annotations
 
 import argparse
-import copy
 import datetime as dt
 import json
+import logging
 import os
 import random
 import re
-import shlex
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 try:
-    from zoneinfo import ZoneInfo
+    import yaml
 except ImportError:
-    sys.exit("Serve Python 3.9 o superiore.")
+    sys.exit("Manca il modulo 'pyyaml'. Esegui:  pip install requests tzdata pyyaml")
 
-try:
-    import requests
-except ImportError:
-    sys.exit("Manca il modulo 'requests'. Esegui:  pip install requests tzdata")
+from notifiche import Notificatore
+from trenitalia import AccessoNegato, Trenitalia, partenze_viste
 
-# ======================= CONFIGURAZIONE (modifica qui) =======================
-VIAGGI = [
-    {"nome": "Andata",  "da": "Torino Porta Susa", "a": "Milano Porta Garibaldi", "ora": "07:50"},
-    {"nome": "Ritorno", "da": "Milano Centrale",   "a": "Torino Porta Susa",      "ora": "18:10"},
-]
-GIORNI_SETTIMANA = (0,1,2,3)   # 0=lun 1=mar 2=mer 3=gio 4=ven  -> lunedi' e giovedi'
-GIORNI_AVANTI = int(os.environ.get("GIORNI_AVANTI") or 14)  # finestra da controllare
-INTERVALLO_MINUTI = 5
-
-# Il tuo carnet vale solo in 2a classe/Standard
-SERVIZI_AMMESSI = ("standard", "2ª", "2a classe", "seconda")
-SERVIZI_ESCLUSI = ("salottino", "executive", "premium", "business")
-ESCLUDI = os.environ.get("ESCLUDI", "")
-
-# Notifiche: impostale come variabili d'ambiente (vedi LEGGIMI.md)
-NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-LINK_PRENOTA = "https://www.trenitalia.com/"
-# ============================================================================
-
-BFF = "https://www.lefrecce.it/Channels.Website.BFF.WEB/website"
 TZ = ZoneInfo("Europe/Rome")
 CARTELLA = Path(__file__).resolve().parent
+FILE_CONFIG = CARTELLA / "config.yaml"
 FILE_STATO = CARTELLA / "stato.json"
 FILE_CURL = CARTELLA / "richiesta_carnet.txt"
 FILE_DEBUG = CARTELLA / "ultima_risposta.json"
-GIORNI = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"]
+NOMI_GIORNI = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"]
+LINK_PREDEFINITO = "https://www.trenitalia.com/"
 
-HEADERS_BROWSER = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
-    "Content-Type": "application/json",
-    "Origin": "https://www.lefrecce.it",
-    "Referer": "https://www.lefrecce.it/",
-}
-
-
-class AccessoNegato(Exception):
-    """Il sito ha risposto 401/403: richiesta scaduta o bloccata."""
+log = logging.getLogger("monitor")
 
 
 def adesso() -> dt.datetime:
     return dt.datetime.now(TZ)
 
 
-def log(msg: str) -> None:
-    print(f"[{adesso():%d/%m %H:%M:%S}] {msg}", flush=True)
+# ----------------------------- configurazione -------------------------------
+class ConfigNonValida(Exception):
+    pass
 
 
-# ------------------------------- notifiche ----------------------------------
-def notifica(titolo: str, testo: str, urgente: bool = True) -> bool:
-    log(f"NOTIFICA >> {titolo} | {testo.replace(chr(10), ' | ')}")
-    inviata = False
-    if NTFY_TOPIC:
-        try:
-            r = requests.post(NTFY_SERVER.rstrip("/") + "/", timeout=15, json={
-                "topic": NTFY_TOPIC, "title": titolo, "message": testo,
-                "priority": 5 if urgente else 3, "tags": ["train"], "click": LINK_PRENOTA,
-            })
-            r.raise_for_status()
-            inviata = True
-        except Exception as e:
-            log(f"ntfy non raggiungibile: {e}")
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", timeout=15, json={
-                "chat_id": TELEGRAM_CHAT_ID, "text": f"{titolo}\n{testo}\n{LINK_PRENOTA}",
-                "disable_web_page_preview": True,
-            })
-            r.raise_for_status()
-            inviata = True
-        except Exception as e:
-            log(f"Telegram non raggiungibile: {e}")
-    return inviata
+@dataclass
+class Viaggio:
+    nome: str
+    da: str
+    a: str
+    ora: str   # "HH:MM"
+
+
+@dataclass
+class Config:
+    viaggi: list[Viaggio]
+    giorni: list[int]          # 0 = lunedi'
+    giorni_avanti: int
+    classi_ammesse: list[str]
+    classi_escluse: list[str]
+    escludi: set[str]
+    speciali: set[str]         # avvisa a ogni controllo, non una volta sola
+    link: str
+    priorita: int
+    intervallo_minuti: float
+
+
+def carica_config(path: Path) -> Config:
+    try:
+        dati = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        raise ConfigNonValida(f"manca il file {path.name}")
+    except yaml.YAMLError as e:
+        raise ConfigNonValida(f"{path.name} non e' scritto bene: {e}")
+    if not isinstance(dati, dict):
+        raise ConfigNonValida(f"{path.name} non contiene le impostazioni attese")
+
+    viaggi = []
+    for i, v in enumerate(dati.get("viaggi") or [], 1):
+        if not isinstance(v, dict) or any(k not in v for k in ("nome", "da", "a", "ora")):
+            raise ConfigNonValida(f"viaggio n. {i}: servono nome, da, a, ora")
+        viaggi.append(Viaggio(str(v["nome"]), str(v["da"]), str(v["a"]), _orario(v["ora"], v["nome"])))
+    if not viaggi:
+        raise ConfigNonValida("nessun treno nella sezione 'viaggi'")
+
+    giorni = []
+    for g in dati.get("giorni") or []:
+        sigla = str(g).strip().lower()[:3]
+        if sigla not in NOMI_GIORNI:
+            raise ConfigNonValida(f"giorno non riconosciuto: '{g}' (usa lun, mar, mer, gio, ven, sab, dom)")
+        giorni.append(NOMI_GIORNI.index(sigla))
+    if not giorni:
+        raise ConfigNonValida("nessun giorno nella sezione 'giorni'")
+
+    classi = dati.get("classi") or {}
+    notifiche = dati.get("notifiche") or {}
+    escludi = list(dati.get("escludi") or []) + [os.environ.get("ESCLUDI", "")]
+    speciali = list(dati.get("giorni_speciali") or []) + [os.environ.get("GIORNI_SPECIALI", "")]
+    return Config(
+        viaggi=viaggi,
+        giorni=sorted(set(giorni)),
+        giorni_avanti=_intero(os.environ.get("GIORNI_AVANTI") or dati.get("giorni_avanti", 14),
+                              "giorni_avanti", 1, 180),
+        classi_ammesse=[str(c) for c in (classi.get("ammesse") or ["standard"])],
+        classi_escluse=[str(c) for c in (classi.get("escluse") or [])],
+        escludi=leggi_lista(escludi),
+        speciali=leggi_lista(speciali),
+        link=os.environ.get("LINK_NOTIFICA") or str(notifiche.get("link") or LINK_PREDEFINITO),
+        priorita=_intero(notifiche.get("priorita", 5), "notifiche.priorita", 1, 5),
+        intervallo_minuti=float(dati.get("intervallo_minuti", 5)),
+    )
+
+
+def _orario(valore, viaggio) -> str:
+    # Senza virgolette YAML legge 18:10 come numero in base 60 (1090): lo riconvertiamo.
+    if isinstance(valore, int) and not isinstance(valore, bool):
+        valore = f"{valore // 60}:{valore % 60:02d}"
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", str(valore).strip())
+    if not m or int(m[1]) > 23 or int(m[2]) > 59:
+        raise ConfigNonValida(f"viaggio '{viaggio}': orario non valido '{valore}' (scrivi ad es. \"07:50\")")
+    return f"{int(m[1]):02d}:{m[2]}"
+
+
+def _intero(valore, nome: str, minimo: int, massimo: int) -> int:
+    try:
+        n = int(str(valore).strip())
+    except ValueError:
+        raise ConfigNonValida(f"{nome}: serve un numero, trovato '{valore}'")
+    if not minimo <= n <= massimo:
+        raise ConfigNonValida(f"{nome}: deve essere tra {minimo} e {massimo}, trovato {n}")
+    return n
+
+
+def leggi_lista(voci: list) -> set[str]:
+    """Liste come ESCLUDI e GIORNI_SPECIALI: "16/11 andata, 19/11" -> {"16/11 andata", "19/11"}."""
+    testo = ",".join(str(x) for x in voci)
+    return {" ".join(x.lower().split()) for x in re.split(r"[,;\n]+", testo) if x.strip()}
 
 
 # --------------------------------- stato ------------------------------------
+# stato.json ricorda com'era ogni treno al controllo precedente
+# (chiave "AAAA-MM-GG Nome" -> True/False), cosi' la notifica parte una volta sola.
+# Le chiavi che iniziano con "_" sono di servizio (codici stazioni, contatori errori).
 def carica_stato() -> dict:
     try:
         return json.loads(FILE_STATO.read_text(encoding="utf-8"))
@@ -146,258 +183,72 @@ def partenza(data: dt.date, hhmm: str) -> dt.datetime:
 
 
 def iso_ricerca(data: dt.date, hhmm: str) -> str:
-    # cerca a partire da 30 minuti prima, cosi' il treno e' tra i primi risultati
+    # cerca da 30 minuti prima, cosi' il treno e' tra i primi risultati
     return (partenza(data, hhmm) - dt.timedelta(minutes=30)).isoformat(timespec="milliseconds")
 
 
-def prossime_date(giorni_avanti: int) -> list[dt.date]:
-    """Lunedi' e giovedi' (GIORNI_SETTIMANA) da oggi ai prossimi `giorni_avanti` giorni."""
+def prossime_date(cfg: Config) -> list[dt.date]:
+    """Giorni da controllare: quelli della settimana scelti, nei prossimi `giorni_avanti` giorni."""
     ora = adesso()
     date = []
-    for i in range(giorni_avanti):
+    for i in range(cfg.giorni_avanti):
         d = ora.date() + dt.timedelta(days=i)
-        if d.weekday() in GIORNI_SETTIMANA and any(partenza(d, v["ora"]) > ora for v in VIAGGI):
+        if d.weekday() in cfg.giorni and any(partenza(d, v.ora) > ora for v in cfg.viaggi):
             date.append(d)
     return date
 
 
-def escluso(data: dt.date, viaggio: str, esclusioni: set[str]) -> bool:
-    """True se il viaggio e' in ESCLUDI (es. '16/11 andata', '2026-11-19', '16/11')."""
+def in_lista(data: dt.date, viaggio: str, lista: set[str]) -> bool:
+    """True se il viaggio e' nella lista (voci come '16/11 andata', '2026-11-19', '16/11')."""
     forme = {data.isoformat(), f"{data:%d/%m}", f"{data.day}/{data.month}"}
-    return any(f in esclusioni or f"{f} {viaggio.lower()}" in esclusioni for f in forme)
+    return any(f in lista or f"{f} {viaggio.lower()}" in lista for f in forme)
 
 
-def leggi_esclusioni(testo: str) -> set[str]:
-    return {" ".join(x.lower().split()) for x in re.split(r"[,;\n]+", testo) if x.strip()}
-
-
-# ------------------------------- stazioni -----------------------------------
-def _norm(s: str) -> str:
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", s.lower()).split())
-
-
-def id_stazione(sess: requests.Session, nome: str, stato: dict) -> int:
-    cache = stato.setdefault("_stazioni", {})
-    if nome in cache:
-        return cache[nome]
-    r = sess.get(f"{BFF}/locations/search", params={"name": nome, "limit": 10}, timeout=20)
-    if r.status_code in (401, 403):
-        raise AccessoNegato(f"HTTP {r.status_code} sulla ricerca stazioni")
-    r.raise_for_status()
-    risultati = r.json() or []
-    scelta = next((s for s in risultati
-                   if _norm(str(s.get("displayName") or s.get("name") or "")) == _norm(nome)), None)
-    if scelta is None:
-        if not risultati:
-            raise RuntimeError(f"stazione non trovata: {nome}")
-        scelta = risultati[0]
-        log(f"Attenzione: per '{nome}' uso '{scelta.get('displayName') or scelta.get('name')}'")
-    cache[nome] = int(scelta["id"])
-    return cache[nome]
-
-
-# ------------------------- richiesta carnet (cURL) --------------------------
-def leggi_curl(path: Path) -> dict:
-    """Legge un 'Copy as cURL (bash)' preso dagli strumenti per sviluppatori del browser."""
-    if not path.exists():
-        raise ValueError(f"manca il file {path.name} (vedi LEGGIMI.md, modalita' carnet)")
-    testo = path.read_text(encoding="utf-8").strip()
-    if "^" in testo and "\\\n" not in testo:
-        raise ValueError("sembra un cURL in formato Windows (cmd): copia 'Copy as cURL (bash)'")
-    testo = re.sub(r"\\\r?\n", " ", testo)
-    try:
-        tok = shlex.split(testo)
-    except ValueError as e:
-        raise ValueError(f"non riesco a leggere il cURL: {e}")
-    if not tok or tok[0] != "curl":
-        raise ValueError("il file deve contenere un comando che inizia con 'curl'")
-
-    url = metodo = dati = None
-    headers: dict[str, str] = {}
-    i = 1
-    while i < len(tok):
-        t = tok[i]
-        nxt = tok[i + 1] if i + 1 < len(tok) else ""
-        if t in ("-H", "--header"):
-            k, _, v = nxt.partition(":")
-            headers[k.strip()] = v.strip()
-            i += 2
-        elif t in ("-b", "--cookie"):
-            headers["Cookie"] = nxt
-            i += 2
-        elif t in ("-A", "--user-agent"):
-            headers["User-Agent"] = nxt
-            i += 2
-        elif t in ("-e", "--referer"):
-            headers["Referer"] = nxt
-            i += 2
-        elif t in ("-X", "--request"):
-            metodo = nxt.upper()
-            i += 2
-        elif t in ("-d", "--data", "--data-raw", "--data-binary", "--data-ascii"):
-            dati = nxt
-            i += 2
-        elif t == "--url":
-            url = nxt
-            i += 2
-        elif t.startswith("-"):
-            i += 1  # --compressed, -s, ecc.
-        else:
-            url = url or t
-            i += 1
-
-    if not url or not dati:
-        raise ValueError("nel cURL mancano l'indirizzo o il corpo della richiesta (--data-raw)")
-    if dati.startswith("$"):
-        dati = dati[1:]
-    try:
-        corpo = json.loads(dati)
-    except json.JSONDecodeError:
-        raise ValueError("il corpo della richiesta non e' JSON: hai copiato la richiesta giusta?")
-
-    via = {"content-length", "accept-encoding", "host"}
-    headers = {k: v for k, v in headers.items() if k.lower() not in via and not k.startswith(":")}
-    trovate: set[str] = set()
-    sostituisci(copy.deepcopy(corpo), {"departureTime": "", "departureLocationId": 0,
-                                       "arrivalLocationId": 0}, trovate)
-    if "departureTime" not in trovate:
-        raise ValueError("nella richiesta non c'e' 'departureTime': non sembra la ricerca dei treni")
-    if "solutions" not in url:
-        log(f"Attenzione: l'indirizzo copiato non contiene 'solutions' ({url}); provo lo stesso.")
-    return {"url": url, "metodo": metodo or "POST", "headers": headers, "corpo": corpo,
-            "mtime": path.stat().st_mtime}
-
-
-def sostituisci(obj, valori: dict, trovate: set) -> None:
-    if isinstance(obj, dict):
-        for k in list(obj):
-            if k in valori:
-                obj[k] = valori[k]
-                trovate.add(k)
-            else:
-                sostituisci(obj[k], valori, trovate)
-    elif isinstance(obj, list):
-        for x in obj:
-            sostituisci(x, valori, trovate)
-
-
-# ------------------------------- ricerca ------------------------------------
-def corpo_pubblico(dep: int, arr: int, quando: str) -> dict:
-    return {
-        "departureLocationId": dep,
-        "arrivalLocationId": arr,
-        "departureTime": quando,
-        "adults": 1,
-        "children": 0,
-        "criteria": {"frecceOnly": True, "regionalOnly": False, "noChanges": True,
-                     "order": "DEPARTURE_DATE", "limit": 10, "offset": 0},
-        "advancedSearchRequest": {"bestFare": False},
-    }
-
-
-def cerca(sess, modo: str, modello: dict | None, dep: int, arr: int, quando: str) -> dict:
-    if modo == "carnet":
-        corpo = copy.deepcopy(modello["corpo"])
-        sostituisci(corpo, {"departureLocationId": dep, "arrivalLocationId": arr,
-                            "departureTime": quando}, set())
-        r = requests.request(modello["metodo"], modello["url"], headers=modello["headers"],
-                             json=corpo, timeout=25)
-    else:
-        r = sess.post(f"{BFF}/ticket/solutions", json=corpo_pubblico(dep, arr, quando), timeout=25)
-    if r.status_code in (401, 403):
-        raise AccessoNegato(f"HTTP {r.status_code}")
-    r.raise_for_status()
-    return r.json()
-
-
-def e_frecciarossa(treno: dict) -> bool:
-    testo = " ".join(str(treno.get(k) or "") for k in
-                     ("trainCategory", "acronym", "denomination", "description")).upper()
-    return not testo.strip() or "FRECCIAROSSA" in testo or re.search(r"\bFR\b", testo) is not None
-
-
-def analizza_servizi(item: dict) -> list[dict]:
-    servizi = []
-    for griglia in item.get("grids") or []:
-        for s in griglia.get("services") or []:
-            nome = str(s.get("name") or s.get("groupName") or "?")
-            low = nome.lower()
-            if not any(a in low for a in SERVIZI_AMMESSI) or any(e in low for e in SERVIZI_ESCLUSI):
-                continue
-            posti, disponibile, offerte = 0, False, []
-            for o in s.get("offers") or []:
-                n = o.get("availableAmount")
-                ok = o.get("status") == "SALEABLE" and (n is None or n > 0)
-                disponibile = disponibile or ok
-                if ok and n:
-                    posti = max(posti, n)
-                offerte.append(f"{o.get('name', '?')}={o.get('status', '?')}/{'?' if n is None else n}")
-            servizi.append({"nome": nome, "disponibile": disponibile, "posti": posti, "offerte": offerte})
-    return servizi
-
-
-def trova_treno(dati: dict, ora: str) -> dict | None:
-    if not isinstance(dati, dict):
-        return None
-    for item in dati.get("solutions") or []:
-        sol = item.get("solution") or item
-        dep = str(sol.get("departureTime") or "")
-        treni = sol.get("trains") or []
-        if dep[11:16] != ora or len(treni) != 1 or not e_frecciarossa(treni[0]):
-            continue
-        servizi = analizza_servizi(item)
-        stato_sol = sol.get("status")
-        disponibile = any(s["disponibile"] for s in servizi) if servizi else stato_sol == "SALEABLE"
-        return {"numero": str(treni[0].get("name") or treni[0].get("number") or "?"),
-                "stato": stato_sol, "servizi": servizi, "disponibile": disponibile}
-    return None
-
-
-# -------------------------------- giro --------------------------------------
-def un_giro(sess, modo: str, modello: dict | None, stato: dict, giorni_avanti: int) -> list[str]:
+# --------------------------------- giro -------------------------------------
+def un_giro(cfg: Config, ti: Trenitalia, notif: Notificatore, stato: dict) -> list[str]:
+    """Controlla tutti i treni una volta. Restituisce gli errori incontrati."""
     errori: list[str] = []
-    esclusioni = leggi_esclusioni(ESCLUDI)
-    for data in prossime_date(giorni_avanti):
-        for v in VIAGGI:
-            if partenza(data, v["ora"]) <= adesso() + dt.timedelta(minutes=5):
+    cache_stazioni = stato.setdefault("_stazioni", {})
+    for data in prossime_date(cfg):
+        for v in cfg.viaggi:
+            if partenza(data, v.ora) <= adesso() + dt.timedelta(minutes=5):
                 continue
-            chiave = f"{data.isoformat()} {v['nome']}"
-            giorno = f"{GIORNI[data.weekday()]} {data:%d/%m}"
-            etichetta = f"{v['nome']} {giorno} {v['ora']} {v['da']} -> {v['a']}"
-            if escluso(data, v["nome"], esclusioni):
-                log(f"{etichetta}: escluso (gia' prenotato)")
+            giorno = f"{NOMI_GIORNI[data.weekday()]} {data:%d/%m}"
+            etichetta = f"{v.nome} {giorno} {v.ora} {v.da} -> {v.a}"
+            if in_lista(data, v.nome, cfg.escludi):
+                log.info("%s: escluso (gia' prenotato)", etichetta)
                 continue
             try:
-                dep = id_stazione(sess, v["da"], stato)
-                arr = id_stazione(sess, v["a"], stato)
-                dati = cerca(sess, modo, modello, dep, arr, iso_ricerca(data, v["ora"]))
+                da = ti.id_stazione(v.da, cache_stazioni)
+                a = ti.id_stazione(v.a, cache_stazioni)
+                dati = ti.cerca(da, a, iso_ricerca(data, v.ora))
             except AccessoNegato:
                 raise
             except Exception as e:
                 errori.append(f"{etichetta}: {e}")
-                log(f"{etichetta}: errore {e}")
+                log.error("%s: errore %s", etichetta, e)
                 continue
 
-            esito = trova_treno(dati, v["ora"])
-            if esito is None:
+            treno = ti.trova_treno(dati, v.ora)
+            if treno is None:
                 FILE_DEBUG.write_text(json.dumps(dati, ensure_ascii=False, indent=2), encoding="utf-8")
-                viste = sorted({str((it.get("solution") or it).get("departureTime") or "")[11:16]
-                                for it in (dati.get("solutions") or []) if isinstance(it, dict)}
-                               ) if isinstance(dati, dict) else []
-                msg = f"treno delle {v['ora']} non trovato (partenze viste: {', '.join(viste) or 'nessuna'})"
+                msg = f"treno delle {v.ora} non trovato (partenze viste: {', '.join(partenze_viste(dati)) or 'nessuna'})"
                 errori.append(f"{etichetta}: {msg}")
-                log(f"{etichetta}: {msg}. Risposta salvata in {FILE_DEBUG.name}")
+                log.warning("%s: %s. Risposta salvata in %s", etichetta, msg, FILE_DEBUG.name)
                 continue
 
-            dettagli = "; ".join(
-                f"{s['nome']}: {s['posti'] if s['posti'] else ('si' if s['disponibile'] else 0)}"
-                for s in esito["servizi"]) or ("posti in vendita" if esito["disponibile"] else "esaurito")
-            log(f"{etichetta} (FR {esito['numero']}): "
-                f"{'DISPONIBILE' if esito['disponibile'] else 'esaurito'} - {dettagli}")
-            if esito["disponibile"] and stato.get(chiave) is not True:
-                notifica(f"Posto libero! {v['nome']} {giorno} {v['ora']}",
-                         f"FR {esito['numero']} {v['da']} → {v['a']}\n{dettagli}\nPrenota subito col carnet.")
-            stato[chiave] = esito["disponibile"]
+            log.info("%s (FR %s): %s - %s", etichetta, treno.numero,
+                     "DISPONIBILE" if treno.disponibile else "esaurito", treno.dettagli())
+            # Notifica quando il treno passa da esaurito (o mai visto) a disponibile.
+            # Per i giorni speciali avvisa a ogni controllo, finche' il posto resta libero.
+            chiave = f"{data.isoformat()} {v.nome}"
+            gia_avvisato = stato.get(chiave) is True
+            speciale = in_lista(data, v.nome, cfg.speciali)
+            if treno.disponibile and (speciale or not gia_avvisato):
+                titolo = "Ancora libero!" if gia_avvisato else "Posto libero!"
+                notif.invia(f"{titolo} {v.nome} {giorno} {v.ora}",
+                            f"FR {treno.numero} {v.da} → {v.a}\n{treno.dettagli()}\nPrenota subito col carnet.")
+            stato[chiave] = treno.disponibile
             time.sleep(random.uniform(1.5, 3.5))
 
     oggi = adesso().date().isoformat()
@@ -406,83 +257,97 @@ def un_giro(sess, modo: str, modello: dict | None, stato: dict, giorni_avanti: i
     return errori
 
 
-def main() -> None:
+# --------------------------------- avvio ------------------------------------
+def configura_log() -> None:
     try:
         sys.stdout.reconfigure(errors="replace")
     except Exception:
         pass
-    ap = argparse.ArgumentParser(description="Avvisa quando si libera un posto sui treni del lunedi' e giovedi'.")
+    formato = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%d/%m %H:%M:%S")
+    formato.converter = lambda s: dt.datetime.fromtimestamp(s, TZ).timetuple()
+    gestore = logging.StreamHandler(sys.stdout)
+    gestore.setFormatter(formato)
+    logging.basicConfig(level=logging.INFO, handlers=[gestore], force=True)
+
+
+def main() -> None:
+    configura_log()
+    ap = argparse.ArgumentParser(description="Avvisa quando si libera un posto sui tuoi Frecciarossa.")
+    ap.add_argument("--config", type=Path, default=FILE_CONFIG, help="file di configurazione (config.yaml)")
     ap.add_argument("--carnet", action="store_true",
-                    help="usa la richiesta copiata dalla pagina 'Prenota con carnet' (richiesta_carnet.txt)")
-    ap.add_argument("--una-volta", action="store_true",
-                    help="un solo controllo e poi esce (GitHub Actions, cron)")
-    ap.add_argument("--giorni", type=int, default=GIORNI_AVANTI,
-                    help=f"quanti giorni in avanti controllare (predefinito {GIORNI_AVANTI})")
-    ap.add_argument("--intervallo", type=float, default=INTERVALLO_MINUTI, help="minuti tra i controlli")
+                    help=f"usa la richiesta copiata dalla pagina 'Prenota con carnet' ({FILE_CURL.name})")
+    ap.add_argument("--una-volta", action="store_true", help="un solo controllo e poi esce (GitHub Actions, cron)")
+    ap.add_argument("--giorni", type=int, help="quanti giorni in avanti controllare (sostituisce config.yaml)")
+    ap.add_argument("--intervallo", type=float, help="minuti tra i controlli (sostituisce config.yaml)")
     ap.add_argument("--test-notifica", action="store_true", help="invia una notifica di prova ed esce")
     args = ap.parse_args()
 
-    if args.test_notifica:
-        if not (NTFY_TOPIC or TELEGRAM_TOKEN):
-            sys.exit("Imposta prima NTFY_TOPIC (o TELEGRAM_TOKEN e TELEGRAM_CHAT_ID).")
-        ok = notifica("Test monitor carnet", "Se leggi questo, le notifiche funzionano.", urgente=False)
-        sys.exit(0 if ok else 1)
-
-    modo = "carnet" if args.carnet else "pubblica"
-    modello = None
-    if modo == "carnet":
-        try:
-            modello = leggi_curl(FILE_CURL)
-        except ValueError as e:
-            sys.exit(f"Modalita' carnet: {e}")
-    if not (NTFY_TOPIC or (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)):
-        log("Attenzione: nessuna notifica configurata (NTFY_TOPIC o TELEGRAM_*). Vedrai gli avvisi solo qui.")
-
-    sess = requests.Session()
-    sess.headers.update(HEADERS_BROWSER)
     stato = carica_stato()
-    giorni = "/".join(GIORNI[g] for g in GIORNI_SETTIMANA)
-    if args.una_volta:
-        log(f"Modalita' {modo}: controllo {giorni} dei prossimi {args.giorni} giorni.")
-    else:
-        log(f"Modalita' {modo}: controllo {giorni} dei prossimi {args.giorni} giorni "
-            f"ogni {args.intervallo:g} minuti. Ctrl+C per fermare.")
+    try:
+        cfg = carica_config(args.config)
+    except ConfigNonValida as e:
+        log.error("Errore in %s: %s", args.config.name, e)
+        if stato.get("_errore_config") != str(e):   # avvisa una volta per lo stesso errore
+            Notificatore(LINK_PREDEFINITO).invia("Monitor treni: config.yaml da correggere", str(e), urgente=False)
+            stato["_errore_config"] = str(e)
+            salva_stato(stato)
+        sys.exit(1)
+    stato.pop("_errore_config", None)
+    if args.giorni:
+        cfg.giorni_avanti = args.giorni
+    intervallo = args.intervallo or cfg.intervallo_minuti
+
+    notif = Notificatore(cfg.link, cfg.priorita)
+    if args.test_notifica:
+        if not notif.configurato:
+            sys.exit("Imposta prima NTFY_TOPIC (o TELEGRAM_TOKEN e TELEGRAM_CHAT_ID).")
+        sys.exit(0 if notif.invia("Test monitor treni", "Se leggi questo, le notifiche funzionano.",
+                                  urgente=False) else 1)
+    if not notif.configurato:
+        log.warning("Nessuna notifica configurata (NTFY_TOPIC o TELEGRAM_*): vedrai gli avvisi solo qui.")
+
+    try:
+        ti = Trenitalia(cfg.classi_ammesse, cfg.classi_escluse, FILE_CURL if args.carnet else None)
+    except ValueError as e:
+        sys.exit(f"Modalita' carnet: {e}")
+
+    giorni = "/".join(NOMI_GIORNI[g] for g in cfg.giorni)
+    log.info("Modalita' %s: controllo %s dei prossimi %d giorni%s.", ti.modo, giorni, cfg.giorni_avanti,
+             "" if args.una_volta else f" ogni {intervallo:g} minuti (Ctrl+C per fermare)")
+    if cfg.speciali:
+        log.info("Giorni speciali (avviso a ogni controllo): %s", ", ".join(sorted(cfg.speciali)))
 
     try:
         while True:
-            if modo == "carnet" and FILE_CURL.exists() and FILE_CURL.stat().st_mtime != modello["mtime"]:
-                try:
-                    modello = leggi_curl(FILE_CURL)
-                    stato["_avvisato_accesso"] = False
-                    log("Richiesta carnet aggiornata ricaricata.")
-                except ValueError as e:
-                    log(f"Nuovo {FILE_CURL.name} non valido ({e}); tengo quello vecchio.")
             try:
-                errori = un_giro(sess, modo, modello, stato, args.giorni)
+                if ti.ricarica_carnet():
+                    stato["_avvisato_accesso"] = False
+                    log.info("Richiesta carnet aggiornata ricaricata.")
+            except ValueError as e:
+                log.warning("Nuovo %s non valido (%s); tengo quello vecchio.", FILE_CURL.name, e)
+            try:
+                errori = un_giro(cfg, ti, notif, stato)
                 stato["_avvisato_accesso"] = False
-                if errori:
-                    stato["_errori"] = stato.get("_errori", 0) + 1
-                    if stato["_errori"] == 3:
-                        notifica("Monitor carnet: problemi", "\n".join(errori[:3]), urgente=False)
-                else:
-                    stato["_errori"] = 0
+                stato["_errori"] = stato.get("_errori", 0) + 1 if errori else 0
+                if stato["_errori"] == 3:   # avvisa dopo 3 giri di fila con problemi
+                    notif.invia("Monitor treni: problemi", "\n".join(errori[:3]), urgente=False)
             except AccessoNegato as e:
-                if modo == "carnet":
+                if ti.modo == "carnet":
                     msg = (f"La richiesta copiata e' scaduta o rifiutata ({e}). "
-                           f"Ricopia il cURL in {FILE_CURL.name}: lo script lo ricarica da solo.")
+                           f"Ricopia il cURL in {FILE_CURL.name}.")
                 else:
                     msg = f"Il sito ha rifiutato la richiesta ({e}), forse un blocco anti-bot. Riprovo."
-                log(msg)
+                log.error(msg)
                 if not stato.get("_avvisato_accesso"):
-                    notifica("Monitor carnet: accesso negato", msg, urgente=False)
+                    notif.invia("Monitor treni: accesso negato", msg, urgente=False)
                     stato["_avvisato_accesso"] = True
             salva_stato(stato)
             if args.una_volta:
                 break
-            time.sleep(max(30.0, args.intervallo * 60 + random.uniform(-20, 20)))
+            time.sleep(max(30.0, intervallo * 60 + random.uniform(-20, 20)))
     except KeyboardInterrupt:
         salva_stato(stato)
-        log("Fermato.")
+        log.info("Fermato.")
 
 
 if __name__ == "__main__":
