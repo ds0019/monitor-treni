@@ -48,6 +48,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ESCLUDI: ${{ vars.ESCLUDI }}
+          GIORNI_SPECIALI: ${{ vars.GIORNI_SPECIALI }}
           GIORNI_AVANTI: ${{ vars.GIORNI_AVANTI }}
         run: python monitor_carnet.py --una-volta $MODO
 
