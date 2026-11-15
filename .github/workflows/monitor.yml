@@ -24,7 +24,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install requests tzdata
+      - run: pip install requests tzdata pyyaml
 
       - name: Recupera lo stato del giro precedente
         uses: actions/cache/restore@v6
