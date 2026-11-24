@@ -29,6 +29,11 @@ classi:
 # Si sommano a quelli della variabile GitHub ESCLUDI (piu' comoda da aggiornare dal telefono).
 escludi: []
 
+# Solo questi viaggi: se la lista non e' vuota controlla SOLO questi, es. ["23/11 andata", "26/11"]
+# (solo la data = andata e ritorno), e ignora "giorni" e "giorni_avanti".
+# Si somma alla variabile GitHub SOLO_GIORNI. Vuota = si usano "giorni" e "giorni_avanti".
+solo_giorni: []
+
 # Giorni speciali: per questi viaggi avvisa a OGNI controllo finche' c'e' posto,
 # non una volta sola. Stesso formato, es. ["16/11 andata", "19/11"].
 # Si sommano a quelli della variabile GitHub GIORNI_SPECIALI. Se un viaggio e' anche in

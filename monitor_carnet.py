@@ -20,6 +20,8 @@ Variabili d'ambiente:
   ESCLUDI          viaggi gia' prenotati, es. "16/11 andata, 19/11" (si somma a config.yaml)
   GIORNI_SPECIALI  viaggi per cui avvisare a OGNI controllo finche' c'e' posto, stesso formato
                    (si somma a giorni_speciali di config.yaml; ESCLUDI vince su GIORNI_SPECIALI)
+  SOLO_GIORNI      se c'e', controlla SOLO questi viaggi, es. "23/11 andata, 26/11"
+                   (ignora giorni e giorni_avanti; si somma a solo_giorni di config.yaml)
   GIORNI_AVANTI    sostituisce giorni_avanti di config.yaml
   LINK_NOTIFICA    sostituisce notifiche.link di config.yaml
 """
@@ -84,6 +86,7 @@ class Config:
     classi_escluse: list[str]
     escludi: set[str]
     speciali: set[str]         # avvisa a ogni controllo, non una volta sola
+    solo: list[tuple[dt.date, str | None]]   # se non vuota: controlla solo questi (giorno, viaggio)
     link: str
     priorita: int
     intervallo_minuti: float
@@ -120,6 +123,7 @@ def carica_config(path: Path) -> Config:
     notifiche = dati.get("notifiche") or {}
     escludi = list(dati.get("escludi") or []) + [os.environ.get("ESCLUDI", "")]
     speciali = list(dati.get("giorni_speciali") or []) + [os.environ.get("GIORNI_SPECIALI", "")]
+    solo = list(dati.get("solo_giorni") or []) + [os.environ.get("SOLO_GIORNI", "")]
     return Config(
         viaggi=viaggi,
         giorni=sorted(set(giorni)),
@@ -129,6 +133,7 @@ def carica_config(path: Path) -> Config:
         classi_escluse=[str(c) for c in (classi.get("escluse") or [])],
         escludi=leggi_lista(escludi),
         speciali=leggi_lista(speciali),
+        solo=leggi_solo_giorni(solo, viaggi, adesso().date()),
         link=os.environ.get("LINK_NOTIFICA") or str(notifiche.get("link") or LINK_PREDEFINITO),
         priorita=_intero(notifiche.get("priorita", 5), "notifiche.priorita", 1, 5),
         intervallo_minuti=float(dati.get("intervallo_minuti", 5)),
@@ -159,6 +164,47 @@ def leggi_lista(voci: list) -> set[str]:
     """Liste come ESCLUDI e GIORNI_SPECIALI: "16/11 andata, 19/11" -> {"16/11 andata", "19/11"}."""
     testo = ",".join(str(x) for x in voci)
     return {" ".join(x.lower().split()) for x in re.split(r"[,;\n]+", testo) if x.strip()}
+
+
+def leggi_solo_giorni(voci: list, viaggi: list[Viaggio], oggi: dt.date) -> list[tuple[dt.date, str | None]]:
+    """SOLO_GIORNI: "23/11 andata, 26/11" -> [(23/11, "andata"), (26/11, None)]. None = tutti i treni."""
+    nomi = {v.nome.lower() for v in viaggi}
+    risultato = []
+    for voce in leggi_lista(voci):
+        parti = voce.split()
+        if len(parti) > 1 and parti[0][:3] in NOMI_GIORNI:   # accetta anche "lun 23/11 andata"
+            parti = parti[1:]
+        if not 1 <= len(parti) <= 2:
+            raise ConfigNonValida(f"SOLO_GIORNI: non capisco '{voce}' (scrivi ad es. \"23/11 andata\" o \"23/11\")")
+        viaggio = parti[1] if len(parti) == 2 else None
+        if viaggio and viaggio not in nomi:
+            raise ConfigNonValida(f"SOLO_GIORNI: in '{voce}' il viaggio '{viaggio}' non esiste "
+                                  f"(in config.yaml ci sono: {', '.join(sorted(nomi))})")
+        risultato.append((_data(parti[0], oggi, voce), viaggio))
+    return sorted(set(risultato), key=lambda x: (x[0], x[1] or ""))
+
+
+def _data(testo: str, oggi: dt.date, voce: str) -> dt.date:
+    """'23/11', '23/11/2026' o '2026-11-23'. Senza anno sceglie la data piu' vicina a oggi
+    (cosi' a dicembre '05/01' vuol dire gennaio prossimo, e '16/11' passato resta passato)."""
+    if m := re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", testo):
+        anno, mese, giorno = int(m[1]), int(m[2]), int(m[3])
+    elif m := re.fullmatch(r"(\d{1,2})/(\d{1,2})(?:/(\d{2}|\d{4}))?", testo):
+        giorno, mese = int(m[1]), int(m[2])
+        anno = None if m[3] is None else int(m[3]) + (2000 if len(m[3]) == 2 else 0)
+    else:
+        raise ConfigNonValida(f"SOLO_GIORNI: data non valida in '{voce}' (scrivi ad es. 23/11)")
+    try:
+        if anno is not None:
+            return dt.date(anno, mese, giorno)
+        data = dt.date(oggi.year, mese, giorno)
+        if data < oggi - dt.timedelta(days=180):
+            data = data.replace(year=oggi.year + 1)
+        elif data > oggi + dt.timedelta(days=185):
+            data = data.replace(year=oggi.year - 1)
+        return data
+    except ValueError:
+        raise ConfigNonValida(f"SOLO_GIORNI: la data di '{voce}' non esiste")
 
 
 # --------------------------------- stato ------------------------------------
@@ -198,9 +244,25 @@ def prossime_date(cfg: Config) -> list[dt.date]:
     return date
 
 
+def da_controllare(cfg: Config) -> list[tuple[dt.date, Viaggio]]:
+    """Coppie (giorno, treno) da controllare in questo giro, in ordine di partenza.
+    Con SOLO_GIORNI solo quelle indicate, altrimenti i giorni scelti nei prossimi giorni_avanti."""
+    if cfg.solo:
+        coppie = [(d, v) for d, nome in cfg.solo for v in cfg.viaggi if nome in (None, v.nome.lower())]
+    else:
+        coppie = [(d, v) for d in prossime_date(cfg) for v in cfg.viaggi]
+    limite = adesso() + dt.timedelta(minutes=5)   # i treni in partenza tra meno di 5 minuti non servono piu'
+    visti, risultato = set(), []
+    for d, v in sorted(coppie, key=lambda c: partenza(c[0], c[1].ora)):
+        if partenza(d, v.ora) > limite and (d, v.nome) not in visti:
+            visti.add((d, v.nome))
+            risultato.append((d, v))
+    return risultato
+
+
 def in_lista(data: dt.date, viaggio: str, lista: set[str]) -> bool:
     """True se il viaggio e' nella lista (voci come '16/11 andata', '2026-11-19', '16/11')."""
-    forme = {data.isoformat(), f"{data:%d/%m}", f"{data.day}/{data.month}"}
+    forme = {data.isoformat(), f"{data:%d/%m}", f"{data.day}/{data.month}", f"{data:%d/%m/%Y}"}
     return any(f in lista or f"{f} {viaggio.lower()}" in lista for f in forme)
 
 
@@ -209,47 +271,55 @@ def un_giro(cfg: Config, ti: Trenitalia, notif: Notificatore, stato: dict) -> li
     """Controlla tutti i treni una volta. Restituisce gli errori incontrati."""
     errori: list[str] = []
     cache_stazioni = stato.setdefault("_stazioni", {})
-    for data in prossime_date(cfg):
-        for v in cfg.viaggi:
-            if partenza(data, v.ora) <= adesso() + dt.timedelta(minutes=5):
-                continue
-            giorno = f"{NOMI_GIORNI[data.weekday()]} {data:%d/%m}"
-            etichetta = f"{v.nome} {giorno} {v.ora} {v.da} -> {v.a}"
-            if in_lista(data, v.nome, cfg.escludi):
-                log.info("%s: escluso (gia' prenotato)", etichetta)
-                continue
-            try:
-                da = ti.id_stazione(v.da, cache_stazioni)
-                a = ti.id_stazione(v.a, cache_stazioni)
-                dati = ti.cerca(da, a, iso_ricerca(data, v.ora))
-            except AccessoNegato:
-                raise
-            except Exception as e:
-                errori.append(f"{etichetta}: {e}")
-                log.error("%s: errore %s", etichetta, e)
-                continue
+    coppie = da_controllare(cfg)
+    if cfg.solo and not coppie:
+        # SOLO_GIORNI impostata ma con sole date passate: lo dico una volta, non resto zitto per sempre
+        voci = ", ".join(f"{d:%d/%m}" + (f" {n}" if n else "") for d, n in cfg.solo)
+        log.warning("SOLO_GIORNI (%s): niente da controllare, sono tutti viaggi passati.", voci)
+        if stato.get("_avviso_solo_vuoto") != voci:
+            notif.invia("Monitor treni: niente da controllare",
+                        f"In SOLO_GIORNI ci sono solo viaggi passati ({voci}). Aggiorna la variabile.", urgente=False)
+            stato["_avviso_solo_vuoto"] = voci
+    elif coppie:
+        stato.pop("_avviso_solo_vuoto", None)
+    for data, v in coppie:
+        giorno = f"{NOMI_GIORNI[data.weekday()]} {data:%d/%m}"
+        etichetta = f"{v.nome} {giorno} {v.ora} {v.da} -> {v.a}"
+        if in_lista(data, v.nome, cfg.escludi):
+            log.info("%s: escluso (gia' prenotato)", etichetta)
+            continue
+        try:
+            da = ti.id_stazione(v.da, cache_stazioni)
+            a = ti.id_stazione(v.a, cache_stazioni)
+            dati = ti.cerca(da, a, iso_ricerca(data, v.ora))
+        except AccessoNegato:
+            raise
+        except Exception as e:
+            errori.append(f"{etichetta}: {e}")
+            log.error("%s: errore %s", etichetta, e)
+            continue
 
-            treno = ti.trova_treno(dati, v.ora)
-            if treno is None:
-                FILE_DEBUG.write_text(json.dumps(dati, ensure_ascii=False, indent=2), encoding="utf-8")
-                msg = f"treno delle {v.ora} non trovato (partenze viste: {', '.join(partenze_viste(dati)) or 'nessuna'})"
-                errori.append(f"{etichetta}: {msg}")
-                log.warning("%s: %s. Risposta salvata in %s", etichetta, msg, FILE_DEBUG.name)
-                continue
+        treno = ti.trova_treno(dati, v.ora)
+        if treno is None:
+            FILE_DEBUG.write_text(json.dumps(dati, ensure_ascii=False, indent=2), encoding="utf-8")
+            msg = f"treno delle {v.ora} non trovato (partenze viste: {', '.join(partenze_viste(dati)) or 'nessuna'})"
+            errori.append(f"{etichetta}: {msg}")
+            log.warning("%s: %s. Risposta salvata in %s", etichetta, msg, FILE_DEBUG.name)
+            continue
 
-            log.info("%s (FR %s): %s - %s", etichetta, treno.numero,
-                     "DISPONIBILE" if treno.disponibile else "esaurito", treno.dettagli())
-            # Notifica quando il treno passa da esaurito (o mai visto) a disponibile.
-            # Per i giorni speciali avvisa a ogni controllo, finche' il posto resta libero.
-            chiave = f"{data.isoformat()} {v.nome}"
-            gia_avvisato = stato.get(chiave) is True
-            speciale = in_lista(data, v.nome, cfg.speciali)
-            if treno.disponibile and (speciale or not gia_avvisato):
-                titolo = "Ancora libero!" if gia_avvisato else "Posto libero!"
-                notif.invia(f"{titolo} {v.nome} {giorno} {v.ora}",
-                            f"FR {treno.numero} {v.da} → {v.a}\n{treno.dettagli()}\nPrenota subito col carnet.")
-            stato[chiave] = treno.disponibile
-            time.sleep(random.uniform(1.5, 3.5))
+        log.info("%s (FR %s): %s - %s", etichetta, treno.numero,
+                 "DISPONIBILE" if treno.disponibile else "esaurito", treno.dettagli())
+        # Notifica quando il treno passa da esaurito (o mai visto) a disponibile.
+        # Per i giorni speciali avvisa a ogni controllo, finche' il posto resta libero.
+        chiave = f"{data.isoformat()} {v.nome}"
+        gia_avvisato = stato.get(chiave) is True
+        speciale = in_lista(data, v.nome, cfg.speciali)
+        if treno.disponibile and (speciale or not gia_avvisato):
+            titolo = "Ancora libero!" if gia_avvisato else "Posto libero!"
+            notif.invia(f"{titolo} {v.nome} {giorno} {v.ora}",
+                        f"FR {treno.numero} {v.da} → {v.a}\n{treno.dettagli()}\nPrenota subito col carnet.")
+        stato[chiave] = treno.disponibile
+        time.sleep(random.uniform(1.5, 3.5))
 
     oggi = adesso().date().isoformat()
     for k in [k for k in stato if not k.startswith("_") and k[:10] < oggi]:
@@ -311,8 +381,12 @@ def main() -> None:
     except ValueError as e:
         sys.exit(f"Modalita' carnet: {e}")
 
-    giorni = "/".join(NOMI_GIORNI[g] for g in cfg.giorni)
-    log.info("Modalita' %s: controllo %s dei prossimi %d giorni%s.", ti.modo, giorni, cfg.giorni_avanti,
+    if cfg.solo:
+        cosa = "solo " + ", ".join(f"{NOMI_GIORNI[d.weekday()]} {d:%d/%m}" + (f" {n}" if n else "")
+                                   for d, n in cfg.solo)
+    else:
+        cosa = f"{'/'.join(NOMI_GIORNI[g] for g in cfg.giorni)} dei prossimi {cfg.giorni_avanti} giorni"
+    log.info("Modalita' %s: controllo %s%s.", ti.modo, cosa,
              "" if args.una_volta else f" ogni {intervallo:g} minuti (Ctrl+C per fermare)")
     if cfg.speciali:
         log.info("Giorni speciali (avviso a ogni controllo): %s", ", ".join(sorted(cfg.speciali)))
