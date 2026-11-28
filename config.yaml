@@ -19,7 +19,8 @@ giorni: [lun, mar, mer, gio]
 # Se su GitHub esiste la variabile GIORNI_AVANTI, vale quella.
 giorni_avanti: 14
 
-# Classi che vanno bene per il tuo carnet (2a classe/Standard).
+# Classi che vanno bene per il tuo carnet (2a classe/Standard). Servono solo in modalita' pubblica:
+# in modalita' carnet e' il sito a dire se il treno e' prenotabile col carnet.
 # Un servizio conta se il nome contiene una parola di "ammesse" e nessuna di "escluse".
 classi:
   ammesse: [standard, "2ª", 2a classe, seconda]
@@ -49,3 +50,7 @@ notifiche:
 
 # Solo quando lo lanci in continuo su un computer (su GitHub decide cron-job.org)
 intervallo_minuti: 5
+
+# Modalita' carnet (secret CARNET_*): se il sistema anti-bot del sito blocca la verifica del carnet,
+# per quel giro si usa la ricerca pubblica e si riprova il carnet solo dopo questi minuti.
+carnet_ogni_minuti: 30

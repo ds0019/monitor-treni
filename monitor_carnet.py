@@ -92,6 +92,7 @@ class Config:
     link: str
     priorita: int
     intervallo_minuti: float
+    carnet_ogni_minuti: int    # se il sito blocca la verifica del carnet, riprova dopo tanti minuti
 
 
 def carica_config(path: Path) -> Config:
@@ -139,6 +140,7 @@ def carica_config(path: Path) -> Config:
         link=os.environ.get("LINK_NOTIFICA") or str(notifiche.get("link") or LINK_PREDEFINITO),
         priorita=_intero(notifiche.get("priorita", 5), "notifiche.priorita", 1, 5),
         intervallo_minuti=float(dati.get("intervallo_minuti", 5)),
+        carnet_ogni_minuti=_intero(dati.get("carnet_ogni_minuti", 30), "carnet_ogni_minuti", 5, 1440),
     )
 
 
@@ -274,6 +276,54 @@ def in_lista(data: dt.date, viaggio: str, lista: set[str]) -> bool:
     return any(f in lista or f"{f} {viaggio.lower()}" in lista for f in forme)
 
 
+# --------------------------------- carnet -----------------------------------
+def prova_carnet(cfg: Config, ti: Trenitalia, notif: Notificatore, stato: dict) -> bool:
+    """Decide se in questo giro si usa la ricerca carnet (ti.usa_carnet).
+    Se il sito l'ha bloccata da poco usa la ricerca pubblica e riprova dopo carnet_ogni_minuti.
+    Restituisce False solo se sul carnet non restano viaggi."""
+    ti.usa_carnet = False
+    if bloccato := stato.get("_carnet_bloccato"):
+        riprova = dt.datetime.fromisoformat(bloccato) + dt.timedelta(minutes=cfg.carnet_ogni_minuti)
+        if adesso() < riprova:
+            log.info("Carnet: il sito l'ha bloccato da poco, riprovo dopo le %s. Intanto ricerca pubblica.",
+                     f"{riprova.astimezone(TZ):%H:%M}")
+            return True
+    try:
+        rimasti = ti.verifica_carnet()          # CarnetNonValido -> main
+    except AccessoNegato as e:
+        segna_blocco_carnet(cfg, notif, stato, e)
+        return True
+    ti.usa_carnet = True
+    if stato.pop("_carnet_bloccato", None):
+        log.info("Carnet: la verifica e' tornata a funzionare.")
+    stato.pop("_avviso_carnet", None)
+    log.info("Carnet verificato%s.", f": {rimasti} viaggi rimasti" if rimasti is not None else "")
+    if rimasti is not None and rimasti <= 0:
+        log.warning("Sul carnet non restano viaggi: non controllo i treni.")
+        if not stato.get("_avviso_carnet_finito"):
+            notif.invia("Monitor treni: carnet finito",
+                        "Sul carnet non restano viaggi. Quando ne compri uno nuovo, aggiorna i secret CARNET_*.",
+                        urgente=False)
+            stato["_avviso_carnet_finito"] = True
+        return False
+    stato.pop("_avviso_carnet_finito", None)
+    return True
+
+
+def segna_blocco_carnet(cfg: Config, notif: Notificatore, stato: dict, errore: Exception) -> None:
+    """Il sistema anti-bot ha rifiutato la parte carnet: lo ricordo e avviso una volta sola."""
+    stato["_carnet_bloccato"] = adesso().isoformat()
+    breve = "Access Denied" if "access denied" in str(errore).lower() else str(errore)[:80]
+    log.warning("Carnet: il sito ha rifiutato la richiesta (%s). Per questo giro ricerca pubblica, "
+                "riprovo il carnet tra %d minuti.", breve, cfg.carnet_ogni_minuti)
+    if not stato.get("_avviso_blocco_carnet"):
+        notif.invia("Monitor treni: carnet non sempre verificabile",
+                    "Il sistema anti-bot di Trenitalia blocca spesso la verifica del carnet dai server di GitHub. "
+                    f"Quando succede ti avviso dei posti in vendita e riprovo il carnet ogni {cfg.carnet_ogni_minuti} "
+                    "minuti. Le notifiche 'Posto libero col carnet!' restano affidabili.", urgente=False)
+        stato["_avviso_blocco_carnet"] = True
+
+
 # --------------------------------- giro -------------------------------------
 def un_giro(cfg: Config, ti: Trenitalia, notif: Notificatore, stato: dict) -> list[str]:
     """Controlla tutti i treni una volta. Restituisce gli errori incontrati."""
@@ -291,20 +341,8 @@ def un_giro(cfg: Config, ti: Trenitalia, notif: Notificatore, stato: dict) -> li
     elif coppie:
         stato.pop("_avviso_solo_vuoto", None)
 
-    if ti.carnet and coppie:
-        # come il pulsante CONFERMA del sito: verifica il carnet (CarnetNonValido/AccessoNegato -> main)
-        rimasti = ti.verifica_carnet()
-        stato.pop("_avviso_carnet", None)
-        log.info("Carnet verificato%s.", f": {rimasti} viaggi rimasti" if rimasti is not None else "")
-        if rimasti is not None and rimasti <= 0:
-            log.warning("Sul carnet non restano viaggi: non controllo i treni.")
-            if not stato.get("_avviso_carnet_finito"):
-                notif.invia("Monitor treni: carnet finito",
-                            "Sul carnet non restano viaggi. Quando ne compri uno nuovo, aggiorna i secret CARNET_*.",
-                            urgente=False)
-                stato["_avviso_carnet_finito"] = True
-            return errori
-        stato.pop("_avviso_carnet_finito", None)
+    if ti.carnet and coppie and not prova_carnet(cfg, ti, notif, stato):
+        return errori          # carnet senza viaggi rimasti: niente da controllare
 
     for data, v in coppie:
         giorno = f"{NOMI_GIORNI[data.weekday()]} {data:%d/%m}"
@@ -313,9 +351,19 @@ def un_giro(cfg: Config, ti: Trenitalia, notif: Notificatore, stato: dict) -> li
             log.info("%s: escluso (gia' prenotato)", etichetta)
             continue
         try:
-            da = ti.id_stazione(v.da, cache_stazioni)
-            a = ti.id_stazione(v.a, cache_stazioni)
-            dati = ti.cerca(da, a, partenza(data, v.ora))
+            try:
+                da = ti.id_stazione(v.da, cache_stazioni)
+                a = ti.id_stazione(v.a, cache_stazioni)
+                dati = ti.cerca(da, a, partenza(data, v.ora))
+            except AccessoNegato as e:
+                if not ti.usa_carnet:
+                    raise
+                # ricerca carnet bloccata a meta' giro: il resto del giro con la ricerca pubblica
+                segna_blocco_carnet(cfg, notif, stato, e)
+                ti.usa_carnet = False
+                da = ti.id_stazione(v.da, cache_stazioni)
+                a = ti.id_stazione(v.a, cache_stazioni)
+                dati = ti.cerca(da, a, partenza(data, v.ora))
         except AccessoNegato:
             raise
         except Exception as e:
@@ -331,16 +379,16 @@ def un_giro(cfg: Config, ti: Trenitalia, notif: Notificatore, stato: dict) -> li
             log.warning("%s: %s. Risposta salvata in %s", etichetta, msg, FILE_DEBUG.name)
             continue
 
-        log.info("%s (FR %s): %s - %s", etichetta, treno.numero,
+        log.info("%s (FR %s) [%s]: %s - %s", etichetta, treno.numero, ti.modo,
                  "DISPONIBILE" if treno.disponibile else "esaurito", treno.dettagli())
         # Notifica quando il treno passa da esaurito (o mai visto) a disponibile.
         # Per i giorni speciali avvisa a ogni controllo, finche' il posto resta libero.
         # Chiavi diverse per le due modalita': "in vendita" non vuol dire "prenotabile col carnet".
-        chiave = f"{data.isoformat()} {v.nome}" + (" carnet" if ti.carnet else "")
+        chiave = f"{data.isoformat()} {v.nome}" + (" carnet" if ti.usa_carnet else "")
         gia_avvisato = stato.get(chiave) is True
         speciale = in_lista(data, v.nome, cfg.speciali)
         if treno.disponibile and (speciale or not gia_avvisato):
-            if ti.carnet:
+            if ti.usa_carnet:
                 titolo = "Ancora libero col carnet!" if gia_avvisato else "Posto libero col carnet!"
                 testo = f"FR {treno.numero} {v.da} → {v.a}\nPrenota subito."
             else:
@@ -414,7 +462,9 @@ def main() -> None:
                                    for d, n in cfg.solo)
     else:
         cosa = f"{'/'.join(NOMI_GIORNI[g] for g in cfg.giorni)} dei prossimi {cfg.giorni_avanti} giorni"
-    log.info("Modalita' %s: controllo %s%s.", ti.modo, cosa,
+    modo = ("carnet (se il sito la blocca: ricerca pubblica, nuovo tentativo ogni "
+            f"{cfg.carnet_ogni_minuti} minuti)" if ti.carnet else ti.modo)
+    log.info("Modalita' %s: controllo %s%s.", modo, cosa,
              "" if args.una_volta else f" ogni {intervallo:g} minuti (Ctrl+C per fermare)")
     if cfg.speciali:
         log.info("Giorni speciali (avviso a ogni controllo): %s", ", ".join(sorted(cfg.speciali)))

@@ -83,6 +83,7 @@ class Trenitalia:
         self.sessione = requests.Session()
         self.sessione.headers.update(HEADERS_BROWSER)
         self.carnet = carnet
+        self.usa_carnet = carnet is not None     # spento quando il sito blocca la parte carnet
         self.travel_id: str | None = None
         self.rimasti: int | None = None          # viaggi rimasti sul carnet
         self.regionale = False
@@ -92,7 +93,7 @@ class Trenitalia:
 
     @property
     def modo(self) -> str:
-        return "carnet" if self.carnet else "pubblica"
+        return "carnet" if self.carnet and self.usa_carnet else "pubblica"
 
     # --- sessione e carnet ---
     def _prepara_sessione(self) -> None:
@@ -146,7 +147,7 @@ class Trenitalia:
     # --- stazioni e ricerca ---
     def id_stazione(self, nome: str, cache: dict) -> int:
         """Codice della stazione sul sito. `cache` evita di cercarla ogni volta."""
-        if _norm(nome) in self.stazioni_carnet:          # stazioni del carnet, se c'e'
+        if self.usa_carnet and _norm(nome) in self.stazioni_carnet:   # stazioni del carnet, se in uso
             return self.stazioni_carnet[_norm(nome)]
         if nome in cache:
             return cache[nome]
@@ -167,7 +168,7 @@ class Trenitalia:
 
     def cerca(self, da: int, a: int, partenza: dt.datetime) -> dict:
         """Soluzioni da `da` ad `a` intorno all'orario `partenza` (datetime con fuso)."""
-        if self.carnet:
+        if self.carnet and self.usa_carnet:
             return self._cerca_carnet(da, a, partenza)
         quando = (partenza - dt.timedelta(minutes=30)).isoformat(timespec="milliseconds")
         r = self.sessione.post(f"{BFF}/ticket/solutions", json=corpo_ricerca(da, a, quando), timeout=25)
