@@ -33,25 +33,20 @@ jobs:
           key: stato-${{ github.run_id }}
           restore-keys: stato-
 
-      - name: Prepara la richiesta carnet (solo se hai creato il secret RICHIESTA_CARNET)
-        env:
-          RICHIESTA_CARNET: ${{ secrets.RICHIESTA_CARNET }}
-        run: |
-          if [ -n "$RICHIESTA_CARNET" ]; then
-            printf '%s' "$RICHIESTA_CARNET" > richiesta_carnet.txt
-            echo "MODO=--carnet" >> "$GITHUB_ENV"
-          fi
-
       - name: Controlla i treni
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Modalita' carnet: se ci sono tutti e tre, controlla i posti prenotabili col carnet
+          CARNET_NUMERO: ${{ secrets.CARNET_NUMERO }}
+          CARNET_NOME: ${{ secrets.CARNET_NOME }}
+          CARNET_COGNOME: ${{ secrets.CARNET_COGNOME }}
           ESCLUDI: ${{ vars.ESCLUDI }}
           GIORNI_SPECIALI: ${{ vars.GIORNI_SPECIALI }}
           SOLO_GIORNI: ${{ vars.SOLO_GIORNI }}
           GIORNI_AVANTI: ${{ vars.GIORNI_AVANTI }}
-        run: python monitor_carnet.py --una-volta $MODO
+        run: python monitor_carnet.py --una-volta
 
       - name: Salva lo stato per il giro successivo
         if: always()
