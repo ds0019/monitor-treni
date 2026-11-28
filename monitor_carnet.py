@@ -13,10 +13,13 @@ Uso:
   python3 monitor_carnet.py --test-notifica   # prova la notifica
   python3 monitor_carnet.py                   # controllo continuo (computer)
   python3 monitor_carnet.py --una-volta       # un solo controllo (GitHub Actions, cron)
-  python3 monitor_carnet.py --carnet          # modalita' carnet (richiesta_carnet.txt)
+  python3 monitor_carnet.py --pubblica        # ignora il carnet: guarda solo i posti in vendita
 
 Variabili d'ambiente:
   NTFY_TOPIC, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID   segreti per le notifiche (vedi notifiche.py)
+  CARNET_NUMERO, CARNET_NOME, CARNET_COGNOME     segreti del carnet: se ci sono tutti e tre lo script
+                   controlla i posti prenotabili COL CARNET (modalita' carnet), altrimenti
+                   solo i posti in vendita (modalita' pubblica)
   ESCLUDI          viaggi gia' prenotati, es. "16/11 andata, 19/11" (si somma a config.yaml)
   GIORNI_SPECIALI  viaggi per cui avvisare a OGNI controllo finche' c'e' posto, stesso formato
                    (si somma a giorni_speciali di config.yaml; ESCLUDI vince su GIORNI_SPECIALI)
@@ -46,13 +49,12 @@ except ImportError:
     sys.exit("Manca il modulo 'pyyaml'. Esegui:  pip install requests tzdata pyyaml")
 
 from notifiche import Notificatore
-from trenitalia import AccessoNegato, Trenitalia, partenze_viste
+from trenitalia import AccessoNegato, Carnet, CarnetNonValido, Trenitalia, partenze_viste
 
 TZ = ZoneInfo("Europe/Rome")
 CARTELLA = Path(__file__).resolve().parent
 FILE_CONFIG = CARTELLA / "config.yaml"
 FILE_STATO = CARTELLA / "stato.json"
-FILE_CURL = CARTELLA / "richiesta_carnet.txt"
 FILE_DEBUG = CARTELLA / "ultima_risposta.json"
 NOMI_GIORNI = ["lun", "mar", "mer", "gio", "ven", "sab", "dom"]
 LINK_PREDEFINITO = "https://www.trenitalia.com/"
@@ -160,6 +162,17 @@ def _intero(valore, nome: str, minimo: int, massimo: int) -> int:
     return n
 
 
+def leggi_carnet() -> Carnet | None:
+    """Il carnet dai secret CARNET_NUMERO, CARNET_NOME, CARNET_COGNOME (mai da config.yaml: la repo e' pubblica)."""
+    valori = [os.environ.get(k, "").strip() for k in ("CARNET_NUMERO", "CARNET_NOME", "CARNET_COGNOME")]
+    if not any(valori):
+        return None
+    if not all(valori):
+        raise ConfigNonValida("per la modalita' carnet servono tutti e tre i secret: "
+                              "CARNET_NUMERO, CARNET_NOME e CARNET_COGNOME")
+    return Carnet(*valori)
+
+
 def leggi_lista(voci: list) -> set[str]:
     """Liste come ESCLUDI e GIORNI_SPECIALI: "16/11 andata, 19/11" -> {"16/11 andata", "19/11"}."""
     testo = ",".join(str(x) for x in voci)
@@ -228,11 +241,6 @@ def partenza(data: dt.date, hhmm: str) -> dt.datetime:
     return dt.datetime.combine(data, dt.time(h, m), tzinfo=TZ)
 
 
-def iso_ricerca(data: dt.date, hhmm: str) -> str:
-    # cerca da 30 minuti prima, cosi' il treno e' tra i primi risultati
-    return (partenza(data, hhmm) - dt.timedelta(minutes=30)).isoformat(timespec="milliseconds")
-
-
 def prossime_date(cfg: Config) -> list[dt.date]:
     """Giorni da controllare: quelli della settimana scelti, nei prossimi `giorni_avanti` giorni."""
     ora = adesso()
@@ -282,6 +290,22 @@ def un_giro(cfg: Config, ti: Trenitalia, notif: Notificatore, stato: dict) -> li
             stato["_avviso_solo_vuoto"] = voci
     elif coppie:
         stato.pop("_avviso_solo_vuoto", None)
+
+    if ti.carnet and coppie:
+        # come il pulsante CONFERMA del sito: verifica il carnet (CarnetNonValido/AccessoNegato -> main)
+        rimasti = ti.verifica_carnet()
+        stato.pop("_avviso_carnet", None)
+        log.info("Carnet verificato%s.", f": {rimasti} viaggi rimasti" if rimasti is not None else "")
+        if rimasti is not None and rimasti <= 0:
+            log.warning("Sul carnet non restano viaggi: non controllo i treni.")
+            if not stato.get("_avviso_carnet_finito"):
+                notif.invia("Monitor treni: carnet finito",
+                            "Sul carnet non restano viaggi. Quando ne compri uno nuovo, aggiorna i secret CARNET_*.",
+                            urgente=False)
+                stato["_avviso_carnet_finito"] = True
+            return errori
+        stato.pop("_avviso_carnet_finito", None)
+
     for data, v in coppie:
         giorno = f"{NOMI_GIORNI[data.weekday()]} {data:%d/%m}"
         etichetta = f"{v.nome} {giorno} {v.ora} {v.da} -> {v.a}"
@@ -291,7 +315,7 @@ def un_giro(cfg: Config, ti: Trenitalia, notif: Notificatore, stato: dict) -> li
         try:
             da = ti.id_stazione(v.da, cache_stazioni)
             a = ti.id_stazione(v.a, cache_stazioni)
-            dati = ti.cerca(da, a, iso_ricerca(data, v.ora))
+            dati = ti.cerca(da, a, partenza(data, v.ora))
         except AccessoNegato:
             raise
         except Exception as e:
@@ -311,13 +335,19 @@ def un_giro(cfg: Config, ti: Trenitalia, notif: Notificatore, stato: dict) -> li
                  "DISPONIBILE" if treno.disponibile else "esaurito", treno.dettagli())
         # Notifica quando il treno passa da esaurito (o mai visto) a disponibile.
         # Per i giorni speciali avvisa a ogni controllo, finche' il posto resta libero.
-        chiave = f"{data.isoformat()} {v.nome}"
+        # Chiavi diverse per le due modalita': "in vendita" non vuol dire "prenotabile col carnet".
+        chiave = f"{data.isoformat()} {v.nome}" + (" carnet" if ti.carnet else "")
         gia_avvisato = stato.get(chiave) is True
         speciale = in_lista(data, v.nome, cfg.speciali)
         if treno.disponibile and (speciale or not gia_avvisato):
-            titolo = "Ancora libero!" if gia_avvisato else "Posto libero!"
-            notif.invia(f"{titolo} {v.nome} {giorno} {v.ora}",
-                        f"FR {treno.numero} {v.da} → {v.a}\n{treno.dettagli()}\nPrenota subito col carnet.")
+            if ti.carnet:
+                titolo = "Ancora libero col carnet!" if gia_avvisato else "Posto libero col carnet!"
+                testo = f"FR {treno.numero} {v.da} → {v.a}\nPrenota subito."
+            else:
+                titolo = "Ancora in vendita:" if gia_avvisato else "Posti in vendita:"
+                testo = (f"FR {treno.numero} {v.da} → {v.a}\n{treno.dettagli()}\n"
+                         f"Col carnet potrebbero essere esauriti.")
+            notif.invia(f"{titolo} {v.nome} {giorno} {v.ora}", testo)
         stato[chiave] = treno.disponibile
         time.sleep(random.uniform(1.5, 3.5))
 
@@ -344,8 +374,8 @@ def main() -> None:
     configura_log()
     ap = argparse.ArgumentParser(description="Avvisa quando si libera un posto sui tuoi Frecciarossa.")
     ap.add_argument("--config", type=Path, default=FILE_CONFIG, help="file di configurazione (config.yaml)")
-    ap.add_argument("--carnet", action="store_true",
-                    help=f"usa la richiesta copiata dalla pagina 'Prenota con carnet' ({FILE_CURL.name})")
+    ap.add_argument("--pubblica", action="store_true",
+                    help="ignora il carnet anche se ci sono i secret CARNET_*: guarda solo i posti in vendita")
     ap.add_argument("--una-volta", action="store_true", help="un solo controllo e poi esce (GitHub Actions, cron)")
     ap.add_argument("--giorni", type=int, help="quanti giorni in avanti controllare (sostituisce config.yaml)")
     ap.add_argument("--intervallo", type=float, help="minuti tra i controlli (sostituisce config.yaml)")
@@ -355,6 +385,7 @@ def main() -> None:
     stato = carica_stato()
     try:
         cfg = carica_config(args.config)
+        carnet = None if args.pubblica else leggi_carnet()
     except ConfigNonValida as e:
         log.error("Errore in %s: %s", args.config.name, e)
         if stato.get("_errore_config") != str(e):   # avvisa una volta per lo stesso errore
@@ -376,10 +407,7 @@ def main() -> None:
     if not notif.configurato:
         log.warning("Nessuna notifica configurata (NTFY_TOPIC o TELEGRAM_*): vedrai gli avvisi solo qui.")
 
-    try:
-        ti = Trenitalia(cfg.classi_ammesse, cfg.classi_escluse, FILE_CURL if args.carnet else None)
-    except ValueError as e:
-        sys.exit(f"Modalita' carnet: {e}")
+    ti = Trenitalia(cfg.classi_ammesse, cfg.classi_escluse, carnet)
 
     if cfg.solo:
         cosa = "solo " + ", ".join(f"{NOMI_GIORNI[d.weekday()]} {d:%d/%m}" + (f" {n}" if n else "")
@@ -390,27 +418,27 @@ def main() -> None:
              "" if args.una_volta else f" ogni {intervallo:g} minuti (Ctrl+C per fermare)")
     if cfg.speciali:
         log.info("Giorni speciali (avviso a ogni controllo): %s", ", ".join(sorted(cfg.speciali)))
+    if not ti.carnet:
+        log.info("Guardo i posti IN VENDITA, non quelli prenotabili col carnet "
+                 "(per quelli servono i secret CARNET_NUMERO, CARNET_NOME, CARNET_COGNOME).")
 
     try:
         while True:
-            try:
-                if ti.ricarica_carnet():
-                    stato["_avvisato_accesso"] = False
-                    log.info("Richiesta carnet aggiornata ricaricata.")
-            except ValueError as e:
-                log.warning("Nuovo %s non valido (%s); tengo quello vecchio.", FILE_CURL.name, e)
             try:
                 errori = un_giro(cfg, ti, notif, stato)
                 stato["_avvisato_accesso"] = False
                 stato["_errori"] = stato.get("_errori", 0) + 1 if errori else 0
                 if stato["_errori"] == 3:   # avvisa dopo 3 giri di fila con problemi
                     notif.invia("Monitor treni: problemi", "\n".join(errori[:3]), urgente=False)
+            except CarnetNonValido as e:
+                msg = (f"Il sito non accetta il carnet: {e}. Controlla i secret CARNET_NUMERO, CARNET_NOME "
+                       f"e CARNET_COGNOME, oppure il carnet e' scaduto.")
+                log.error(msg)
+                if stato.get("_avviso_carnet") != str(e):   # una volta per lo stesso errore
+                    notif.invia("Monitor treni: carnet non accettato", msg, urgente=False)
+                    stato["_avviso_carnet"] = str(e)
             except AccessoNegato as e:
-                if ti.modo == "carnet":
-                    msg = (f"La richiesta copiata e' scaduta o rifiutata ({e}). "
-                           f"Ricopia il cURL in {FILE_CURL.name}.")
-                else:
-                    msg = f"Il sito ha rifiutato la richiesta ({e}), forse un blocco anti-bot. Riprovo."
+                msg = f"Il sito ha rifiutato la richiesta ({e}), forse il sistema anti-bot. Riprovo al prossimo giro."
                 log.error(msg)
                 if not stato.get("_avvisato_accesso"):
                     notif.invia("Monitor treni: accesso negato", msg, urgente=False)
